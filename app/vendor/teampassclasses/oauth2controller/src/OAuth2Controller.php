@@ -46,6 +46,13 @@ class OAuth2Controller
     protected $provider;
     protected $settings;
 
+    /**
+     * True when the configured provider is Google Identity (Google Workspace).
+     *
+     * @var bool
+     */
+    protected $isGoogle = false;
+
     public function __construct(array $settings)
     {
         // Initialize the settings property
@@ -72,6 +79,32 @@ class OAuth2Controller
                 'defaultEndPointVersion'  => '2.0',  // Endpoint version
             ]);
 
+        // Google Workspace / Google Identity
+        } elseif (self::isGoogleEndpoint((string) $settings['oauth2_client_endpoint']) === true) {
+
+            // A hosted domain is mandatory: without it any personal Google account
+            // would be allowed to sign in to this instance
+            if (empty($settings['oauth2_tenant_id']) === true) {
+                throw new Exception('Invalid hosted domain provided. A Google Workspace domain is mandatory.');
+            }
+
+            // Google publishes fixed endpoints, so they are not read from the settings
+            $this->isGoogle = true;
+            $this->provider = new GenericProvider([
+                'clientId'                => $settings['oauth2_client_id'],
+                'clientSecret'            => $settings['oauth2_client_secret'],
+                'redirectUri'             => rtrim($settings['cpassman_url'], '/').'/index.php?post_type=oauth2',
+                'urlAuthorize'            => 'https://accounts.google.com/o/oauth2/v2/auth',
+                'urlAccessToken'          => 'https://oauth2.googleapis.com/token',
+                'urlResourceOwnerDetails' => 'https://openidconnect.googleapis.com/v1/userinfo',
+                // Signing in only needs the OpenID Connect scopes. The scope setting
+                // keeps the Microsoft Graph scopes of an existing Entra setup, and Google
+                // rejects those, so it is deliberately not reused here.
+                'scopes'                  => self::GOOGLE_SCOPES,
+                // OAuth2 scopes are space-delimited (RFC 6749 §3.3); League defaults to ','
+                'scopeSeparator'          => ' ',
+            ]);
+
         // Generic Oauth2 provider
         } else {
 
@@ -86,6 +119,60 @@ class OAuth2Controller
                 // OAuth2 scopes are space-delimited (RFC 6749 §3.3); League defaults to ','
                 'scopeSeparator'          => ' ',
             ]);
+        }
+    }
+
+    /**
+     * Scopes requested from Google. Signing in uses no Google API, so the
+     * three OpenID Connect scopes are all that is needed.
+     *
+     * @var array<int, string>
+     */
+    private const GOOGLE_SCOPES = ['openid', 'email', 'profile'];
+
+    /**
+     * Tell whether an authorization endpoint belongs to Google Identity.
+     *
+     * @param string $authorizationEndpoint Value of the oauth2_client_endpoint setting.
+     * @return bool True when the endpoint is Google's.
+     */
+    private static function isGoogleEndpoint(string $authorizationEndpoint): bool
+    {
+        return str_contains($authorizationEndpoint, 'accounts.google.com');
+    }
+
+    /**
+     * Tell whether a Google account belongs to the expected Workspace domain.
+     *
+     * The `hd` claim is the only reliable signal: Google documents that its absence
+     * means the account is not part of a Cloud organization, and that the domain of
+     * the `email` claim must not be used instead.
+     *
+     * @param array<string, mixed> $claims         Google UserInfo claims.
+     * @param string               $expectedDomain Workspace domain from the settings.
+     * @return bool True when the account belongs to the expected domain.
+     */
+    public static function googleHostedDomainIsAllowed(array $claims, string $expectedDomain): bool
+    {
+        $hostedDomain = strtolower(self::firstClaim($claims, ['hd']));
+        $expected = strtolower(trim($expectedDomain));
+
+        return $hostedDomain !== '' && $expected !== '' && $hostedDomain === $expected;
+    }
+
+    /**
+     * Refuse a Google account that is not part of the configured Workspace domain.
+     *
+     * The check reads the UserInfo response, so bypassing the account chooser
+     * with a personal Google account still fails here.
+     *
+     * @param array<string, mixed> $claims Google UserInfo claims.
+     * @throws Exception When the account does not belong to the expected domain.
+     */
+    public function assertGoogleAccountIsAllowed(array $claims): void
+    {
+        if (self::googleHostedDomainIsAllowed($claims, (string) ($this->settings['oauth2_tenant_id'] ?? '')) === false) {
+            throw new Exception('This Google account does not belong to the allowed Workspace domain.');
         }
     }
 
@@ -106,6 +193,28 @@ class OAuth2Controller
         ));
     }
 
+    /**
+     * Options sent with the authorization request.
+     *
+     * Google is asked to preselect the configured Workspace domain. The hint only
+     * pre-filters the account chooser; the domain itself is enforced on the callback.
+     *
+     * @return array<string, string>
+     */
+    protected function authorizationOptions(): array
+    {
+        // Force user to select account
+        $options = [
+            'prompt' => 'select_account',
+        ];
+
+        if ($this->isGoogle === true) {
+            $options['hd'] = (string) $this->settings['oauth2_tenant_id'];
+        }
+
+        return $options;
+    }
+
     public function redirect()
     {
         // Force a unique tenant by refusing any other configuration
@@ -113,13 +222,8 @@ class OAuth2Controller
             throw new Exception('Multi-tenant access is not allowed. Tenant must be specified.');
         }
 
-        // Force user to select account
-        $options = [
-            'prompt' => 'select_account'
-        ];
-
-        // Redirect the user to Azure AD for authentication
-        $authUrl = $this->provider->getAuthorizationUrl($options);
+        // Redirect the user to the identity provider for authentication
+        $authUrl = $this->provider->getAuthorizationUrl($this->authorizationOptions());
         $_SESSION['oauth2state'] = $this->provider->getState();
         header('Location: ' . $authUrl);
         exit;
@@ -164,6 +268,11 @@ class OAuth2Controller
                 // Get user infos from the UserInfo endpoint of the provider
                 $resourceOwner = $this->provider->getResourceOwner($token);
                 $user = self::mapGenericUserInfo($resourceOwner->toArray());
+
+                if ($this->isGoogle === true) {
+                    $this->assertGoogleAccountIsAllowed($user);
+                }
+
                 $userGroups = $user['groups'];
             }
 
@@ -187,7 +296,8 @@ class OAuth2Controller
      * the TeamPass login flow reads, which follow the Microsoft Graph naming of Entra.
      *
      * - `preferred_username` becomes `userPrincipalName`: its part before '@' is the
-     *   TeamPass login;
+     *   TeamPass login. Google returns no such claim, so `email` is accepted as a
+     *   fallback;
      * - `sub` (or `id`) must be present: the login page derives the account password
      *   from it, so it has to be stable for the account to open its keys;
      * - `groups` (standard claim) and `realm_access.roles` (Keycloak) are merged into a
@@ -206,9 +316,9 @@ class OAuth2Controller
             throw new Exception('The identity provider returned no "sub" claim. Check that the "openid" scope is requested.');
         }
 
-        $login = self::firstClaim($claims, ['preferred_username']);
+        $login = self::firstClaim($claims, ['preferred_username', 'email']);
         if (trim($login) === '') {
-            throw new Exception('The identity provider returned no "preferred_username" claim. Check that the "profile" scope is requested.');
+            throw new Exception('The identity provider returned no "preferred_username" or "email" claim. Check that the "profile" and "email" scopes are requested.');
         }
 
         $user = $claims;
