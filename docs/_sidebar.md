@@ -17,6 +17,7 @@
 - [Extension](misc/extension.md)
 - **Features**
 - [Authentication](features/authentication.md)
+- [Google Workspace SSO](features/google-workspace-sso.md)
 - [Backups](features/backups.md)
 - [Items](features/items.md)
 - [Search](features/search.md)
